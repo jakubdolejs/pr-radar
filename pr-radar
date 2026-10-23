@@ -72,7 +72,7 @@ def apply_config(cfg):
 def load_config():
     cfg = dict(DEFAULTS)
     if CONFIG.exists():
-        cfg.update(json.loads(CONFIG.read_text()))
+        cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
     apply_config(cfg)
     return cfg
 
@@ -80,10 +80,10 @@ def load_config():
 def save_repos(repos):
     cfg = dict(DEFAULTS)
     if CONFIG.exists():
-        cfg.update(json.loads(CONFIG.read_text()))
+        cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
     cfg["repos"] = repos
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     apply_config(cfg)
 
 
@@ -139,7 +139,7 @@ PR_FIELDS = """
 
 def log(msg):
     DATA.mkdir(parents=True, exist_ok=True)
-    with LOG.open("a") as f:
+    with LOG.open("a", encoding="utf-8") as f:
         f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
     if LOG.stat().st_size > 512_000:  # crude rotation
         LOG.replace(LOG.with_suffix(".log.1"))
@@ -155,7 +155,7 @@ def gh_run(*args):
     gh = gh_bin()
     if not gh:
         raise RuntimeError("gh not found: install it with `brew install gh`")
-    return subprocess.run([gh, *args], capture_output=True, text=True, timeout=60)
+    return subprocess.run([gh, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=60)
 
 
 def gh_check():
@@ -450,7 +450,7 @@ def page(body):
 
 def write_atomic(path, text):
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 
@@ -470,7 +470,7 @@ def run(open_dashboard):
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         events = []
         if SNAPSHOT.exists():
-            prev = json.loads(SNAPSHOT.read_text())
+            prev = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
             known = set(prev.get("repos", REPOS))  # snapshots from before repos were recorded watched all current ones
             prev["needs_review"] = {k: p for k, p in prev["needs_review"].items() if p["repo"] in REPOS}
             prev["mine"] = {k: p for k, p in prev["mine"].items() if p["repo"] in REPOS}
@@ -491,7 +491,7 @@ def run(open_dashboard):
     except Exception as e:  # noqa: BLE001
         STATE["error"] = str(e)
         log(f"ERROR: {e}")
-        n = int(FAILS.read_text() or 0) + 1 if FAILS.exists() else 1
+        n = int(FAILS.read_text(encoding="utf-8") or 0) + 1 if FAILS.exists() else 1
         FAILS.write_text(str(n))
         if n == FAIL_NOTIFY_AFTER:
             notify("PR Radar is failing", f"{n} failed runs in a row; see pr-radar.log", "failing")
@@ -544,12 +544,13 @@ def install_app():
     shutil.rmtree(APP_BUNDLE, ignore_errors=True)
     setup = f"""from setuptools import setup
 setup(name="PR Radar", app=[{str(INSTALLED_SCRIPT)!r}], options={{"py2app": {{"alias": True, "iconfile": {str(INSTALL / "PR Radar.icns")!r}, "plist": {{
-    "CFBundleName": "PR Radar", "CFBundleIdentifier": {APP_ID!r}, "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0"}}}}}})
+    "CFBundleName": "PR Radar", "CFBundleIdentifier": {APP_ID!r}, "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+    "LSEnvironment": {{"PYTHONUTF8": "1"}}}}}}}})
 """
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "setup.py").write_text(setup)
+        (Path(tmp) / "setup.py").write_text(setup, encoding="utf-8")
         r = subprocess.run([python, "setup.py", "py2app", "-A", "--dist-dir", str(APP_BUNDLE.parent)],
-                           cwd=tmp, capture_output=True, text=True)
+                           cwd=tmp, capture_output=True, encoding="utf-8", errors="replace")
     if r.returncode or not APP_BUNDLE.exists():
         print(r.stdout[-2000:] + r.stderr[-2000:], file=sys.stderr)
         return 1
@@ -596,7 +597,7 @@ def gui():
     from WebKit import WKWebView, WKWebViewConfiguration
 
     DATA.mkdir(parents=True, exist_ok=True)
-    sys.stdout = sys.stderr = LOG.open("a", buffering=1)  # a bundled app has no terminal: tracebacks go to the log
+    sys.stdout = sys.stderr = LOG.open("a", buffering=1, encoding="utf-8")  # a bundled app has no terminal: tracebacks go to the log
     load_config()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
