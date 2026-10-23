@@ -529,6 +529,7 @@ def install_app():
     INSTALL.mkdir(parents=True, exist_ok=True)
     shutil.copy2(SCRIPT, INSTALLED_SCRIPT)
     shutil.copy2(SCRIPT.parent / "requirements.txt", INSTALL / "requirements.txt")
+    shutil.copy2(SCRIPT.parent / "icon" / "PR Radar.icns", INSTALL / "PR Radar.icns")
     python = INSTALLED_VENV / "bin/python"
     if not python.exists():  # missing, or its Python was removed (e.g. brew upgraded it): start over
         step("Creating a Python environment")
@@ -542,7 +543,7 @@ def install_app():
     step(f"Building {APP_BUNDLE}")
     shutil.rmtree(APP_BUNDLE, ignore_errors=True)
     setup = f"""from setuptools import setup
-setup(name="PR Radar", app=[{str(INSTALLED_SCRIPT)!r}], options={{"py2app": {{"alias": True, "plist": {{
+setup(name="PR Radar", app=[{str(INSTALLED_SCRIPT)!r}], options={{"py2app": {{"alias": True, "iconfile": {str(INSTALL / "PR Radar.icns")!r}, "plist": {{
     "CFBundleName": "PR Radar", "CFBundleIdentifier": {APP_ID!r}, "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0"}}}}}})
 """
     with tempfile.TemporaryDirectory() as tmp:
