@@ -17,10 +17,9 @@ A Mac app that tracks your GitHub pull requests via the [`gh`](https://cli.githu
 
     git clone https://github.com/jakubdolejs/pr-radar.git
     cd pr-radar
-    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     ./pr-radar
 
-The first run builds `~/Applications/PR Radar.app` (an alias bundle that runs this checkout, so keep the folder where it is; if you move it, re-run `./pr-radar install-app`) and opens it. Afterwards open it from Spotlight or the Dock like any app.
+The first run installs PR Radar (about a minute): it copies the code and a private Python environment to `~/Library/Application Support/pr-radar/app`, builds `~/Applications/PR Radar.app`, and opens it. You can delete the clone afterwards; the app doesn't depend on it. Open it from Spotlight or the Dock like any app.
 
 On first launch pick the repos to watch in the **Repos** menu: tick or untick repos, or add one by name. The list shows repos where you recently authored or reviewed PRs first, then the rest alphabetically. Newly added repos start with a silent baseline, so you don't get a burst of notifications. Allow notifications when macOS asks.
 
@@ -31,25 +30,31 @@ On first launch pick the repos to watch in the **Repos** menu: tick or untick re
 
 ## Command line
 
-    ./pr-radar              # open the app, building it first if needed
-    ./pr-radar install-app  # rebuild the app bundle
-    ./pr-radar --once [--open]   # fetch once, write the dashboard and notify (--open shows it in your browser)
+    ./pr-radar                      # open the app, installing it first if needed
+    ./pr-radar install-app          # reinstall; also how you update (see below)
+    ./pr-radar uninstall [--purge]  # remove the app and its environment (--purge: also config and data)
+    ./pr-radar --once [--open]      # fetch once, write the dashboard and notify (--open shows it in your browser)
+
+Running `./pr-radar` from a clone opens the *installed* app, not the clone's code, and tells you when the installed copy is older.
 
 ## Config and data
 
 - Settings: `~/.config/pr-radar/config.json` (repos, timezone, work hours/days, poll interval, required approvals).
-- Generated data (dashboard, snapshot, log): `~/Library/Application Support/pr-radar/`. Check `pr-radar.log` if something looks wrong.
+- Generated data (dashboard, snapshot, log): `~/Library/Application Support/pr-radar/`. Check `pr-radar.log` if something looks wrong. The installed copy of the app is in its `app/` subfolder.
 - First run only records a baseline (no notifications). One notification after 6 consecutive failed polls.
 
 ## Updating
 
-    git pull && .venv/bin/pip install -r requirements.txt && ./pr-radar install-app
+    git pull && ./pr-radar install-app
 
-Then quit and reopen the app.
+Then quit and reopen the app. If Homebrew upgrades Python and the app stops launching, run `./pr-radar install-app` again to rebuild its environment.
 
 ## Uninstalling
 
-Quit the app, then delete `~/Applications/PR Radar.app`, `~/.config/pr-radar`, `~/Library/Application Support/pr-radar` and the checkout. Remove it from Login Items if you added it.
+    ./pr-radar uninstall            # keeps your config and data
+    ./pr-radar uninstall --purge    # removes those too
+
+Remove PR Radar from Login Items too if you added it.
 
 ## Licence
 

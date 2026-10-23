@@ -2,8 +2,10 @@
 """pr-radar: a Mac app that tracks your GitHub PRs via `gh` and notifies you when they change.
 
 Usage:
-  pr-radar                 open PR Radar.app (building it first if needed)
-  pr-radar install-app     (re)build ~/Applications/PR Radar.app, a py2app alias bundle pointing at this checkout
+  pr-radar                 open PR Radar.app, installing it first if needed
+  pr-radar install-app     (re)install: copy the code and a Python environment to Application Support,
+                           build ~/Applications/PR Radar.app; also how you update after `git pull`
+  pr-radar uninstall [--purge]   remove the app and its environment (--purge: also your config and data)
   pr-radar --once [--open] fetch once, write the dashboard, notify (--open shows it in your browser)
 
 Settings live in ~/.config/pr-radar/config.json, generated data in ~/Library/Application Support/pr-radar.
@@ -25,7 +27,6 @@ APP = "pr-radar"
 APP_ID = "com.jakubdolejs.pr-radar"
 
 SCRIPT = Path(os.path.realpath(__file__))
-ROOT = SCRIPT.parent
 CONFIG = Path.home() / ".config" / APP / "config.json"
 DATA = Path.home() / "Library/Application Support" / APP
 SNAPSHOT = DATA / "snapshot.json"
@@ -33,6 +34,9 @@ FAILS = DATA / "failures.count"
 LOG = DATA / "pr-radar.log"
 DASHBOARD = DATA / "dashboard.html"
 APP_BUNDLE = Path.home() / "Applications" / "PR Radar.app"
+INSTALL = DATA / "app"  # what the app runs: a copy of this script and its own venv, so the checkout can be deleted
+INSTALLED_SCRIPT = INSTALL / "pr-radar"
+INSTALLED_VENV = INSTALL / ".venv"
 
 
 # ---- config -----------------------------------------------------------------
@@ -504,20 +508,41 @@ def in_app_bundle():
     return os.environ.get("RESOURCEPATH", "").endswith(".app/Contents/Resources")  # set by the py2app launcher
 
 
+def step(msg):
+    print(f"==> {msg}", flush=True)
+
+
 def install_app():
-    """Build ~/Applications/PR Radar.app (py2app alias bundle pointing at this checkout).
+    """Install PR Radar: a copy of the code plus its own venv under Application Support, and a py2app alias bundle
+    in ~/Applications that runs that copy (so deleting this checkout doesn't break the app).
 
     It has to be a real bundle running as its own process: a shell launcher that execs python is registered
     as "Python", and macOS then hides its menu bar item and attributes notifications to Python.
     """
-    python = ROOT / ".venv/bin/python"
-    python = python if python.exists() else Path(sys.executable)
-    if subprocess.run([python, "-c", "import py2app"], capture_output=True).returncode:
-        print("building the app needs py2app: pip install -r requirements.txt", file=sys.stderr)
+    if not gh_bin():
+        print("PR Radar needs the GitHub CLI: brew install gh && gh auth login", file=sys.stderr)
         return 1
+    if gh_run("auth", "status").returncode:
+        print("gh isn't logged in: run `gh auth login`, then try again", file=sys.stderr)
+        return 1
+    step(f"Copying PR Radar to {INSTALL}")
+    INSTALL.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SCRIPT, INSTALLED_SCRIPT)
+    shutil.copy2(SCRIPT.parent / "requirements.txt", INSTALL / "requirements.txt")
+    python = INSTALLED_VENV / "bin/python"
+    if not python.exists():  # missing, or its Python was removed (e.g. brew upgraded it): start over
+        step("Creating a Python environment")
+        shutil.rmtree(INSTALLED_VENV, ignore_errors=True)
+        if subprocess.run([sys.executable, "-m", "venv", str(INSTALLED_VENV)]).returncode:
+            return 1
+    step("Installing dependencies (takes a minute the first time)")
+    if subprocess.run([python, "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                       "-r", str(INSTALL / "requirements.txt")]).returncode:
+        return 1
+    step(f"Building {APP_BUNDLE}")
     shutil.rmtree(APP_BUNDLE, ignore_errors=True)
     setup = f"""from setuptools import setup
-setup(name="PR Radar", app=[{str(SCRIPT)!r}], options={{"py2app": {{"alias": True, "plist": {{
+setup(name="PR Radar", app=[{str(INSTALLED_SCRIPT)!r}], options={{"py2app": {{"alias": True, "plist": {{
     "CFBundleName": "PR Radar", "CFBundleIdentifier": {APP_ID!r}, "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0"}}}}}})
 """
     with tempfile.TemporaryDirectory() as tmp:
@@ -530,13 +555,31 @@ setup(name="PR Radar", app=[{str(SCRIPT)!r}], options={{"py2app": {{"alias": Tru
     lsregister = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework"
                   "/Support/lsregister")
     subprocess.run([lsregister, "-f", str(APP_BUNDLE)], capture_output=True)  # drop LaunchServices' cached Info.plist
-    print(f"created {APP_BUNDLE}")
+    step("Installed. If PR Radar is running, quit and reopen it to pick up the update.")
+    return 0
+
+
+def uninstall(purge):
+    subprocess.run(["osascript", "-e", 'if application "PR Radar" is running then tell application "PR Radar" to quit'], capture_output=True)
+    gone = [APP_BUNDLE, INSTALL]
+    if purge:
+        gone += [CONFIG.parent, DATA]  # DATA also contains INSTALL
+    for path in gone:
+        if path.exists():
+            shutil.rmtree(path)
+            print(f"removed {path}")
+    if not purge:
+        print(f"kept your config ({CONFIG}) and data ({DATA}); add --purge to remove those too")
+    print("If you added PR Radar to Login Items, remove it in System Settings > General > Login Items & Extensions.")
     return 0
 
 
 def launch_app():
-    if not APP_BUNDLE.exists() and install_app():
-        return 1
+    if not APP_BUNDLE.exists() or not INSTALLED_SCRIPT.exists():
+        if install_app():
+            return 1
+    elif INSTALLED_SCRIPT.read_bytes() != SCRIPT.read_bytes():
+        print("note: the installed app is older than this checkout; run `./pr-radar install-app` to update it")
     subprocess.run(["open", str(APP_BUNDLE)])
     return 0
 
@@ -812,6 +855,8 @@ def main():
     args = sys.argv[1:]
     if args == ["install-app"]:
         return install_app()
+    if args in (["uninstall"], ["uninstall", "--purge"]):
+        return uninstall("--purge" in args)
     if not args:
         return gui() if in_app_bundle() else launch_app()
     if set(args) <= {"--once", "--open"} and "--once" in args:
