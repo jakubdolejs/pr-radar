@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""pr-radar: a Mac app that tracks your GitHub PRs via `gh` and notifies you when they change.
+
+Usage:
+  pr-radar                 open PR Radar.app (building it first if needed)
+  pr-radar install-app     (re)build ~/Applications/PR Radar.app, a py2app alias bundle pointing at this checkout
+  pr-radar --once [--open] fetch once, write the dashboard, notify (--open shows it in your browser)
+
+Settings live in ~/.config/pr-radar/config.json, generated data in ~/Library/Application Support/pr-radar.
+"""
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+APP = "pr-radar"
+APP_ID = "com.jakubdolejs.pr-radar"
+
+SCRIPT = Path(os.path.realpath(__file__))
+ROOT = SCRIPT.parent
+CONFIG = Path.home() / ".config" / APP / "config.json"
+DATA = Path.home() / "Library/Application Support" / APP
+SNAPSHOT = DATA / "snapshot.json"
+FAILS = DATA / "failures.count"
+LOG = DATA / "pr-radar.log"
+DASHBOARD = DATA / "dashboard.html"
+APP_BUNDLE = Path.home() / "Applications" / "PR Radar.app"
+
+
+# ---- config -----------------------------------------------------------------
+def local_timezone():
+    try:
+        return os.path.realpath("/etc/localtime").split("zoneinfo/", 1)[1]
+    except IndexError:
+        return "UTC"
+
+
+DEFAULTS = {
+    "repos": [],                       # "owner/name" entries; picked in the Repos menu
+    "timezone": local_timezone(),
+    "work_days": [0, 1, 2, 3, 4],      # Mon-Fri (0 = Monday)
+    "work_hours": [8, 19],             # 08:00 <= now < 19:00 in `timezone`
+    "poll_seconds": 300,               # how often the app polls GitHub (macOS may stretch this when the app is idle)
+    "required_approvals": 2,           # human approvals needed before merge
+    "fail_notify_after": 6,            # one notification after this many consecutive failures
+}
+
+
+def apply_config(cfg):
+    global REPOS, TZ, WORK_DAYS, WORK_HOURS, POLL_SECONDS, REQUIRED_APPROVALS, FAIL_NOTIFY_AFTER
+    REPOS = list(cfg["repos"])
+    TZ = ZoneInfo(cfg["timezone"])
+    WORK_DAYS = list(cfg["work_days"])
+    WORK_HOURS = tuple(cfg["work_hours"])
+    POLL_SECONDS = cfg["poll_seconds"]
+    REQUIRED_APPROVALS = cfg["required_approvals"]
+    FAIL_NOTIFY_AFTER = cfg["fail_notify_after"]
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG.exists():
+        cfg.update(json.loads(CONFIG.read_text()))
+    apply_config(cfg)
+    return cfg
+
+
+def save_repos(repos):
+    cfg = dict(DEFAULTS)
+    if CONFIG.exists():
+        cfg.update(json.loads(CONFIG.read_text()))
+    cfg["repos"] = repos
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    apply_config(cfg)
+
+
+REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def check_repos(repos):
+    """Problems with the given repos (empty list when all are fine)."""
+    problems = []
+    for r in repos:
+        if not REPO_RE.match(r):
+            problems.append(f"{r}: expected owner/name")
+        elif gh_run("api", f"repos/{r}", "--silent").returncode:
+            problems.append(f"{r}: not accessible with your gh login")
+    return problems or ([] if repos else ["enter at least one repo"])
+
+
+def candidate_repos(selected):
+    """Repos to offer: ones you touched recently (newest first), then the rest alphabetically.
+
+    "Touched" = PRs you authored or reviewed; the rest are repos you've contributed to plus your current picks.
+    """
+    q = """{
+      a: search(query: "is:pr author:@me sort:updated-desc", type: ISSUE, first: 50) { nodes { ...R } }
+      r: search(query: "is:pr reviewed-by:@me sort:updated-desc", type: ISSUE, first: 50) { nodes { ...R } }
+      viewer { repositoriesContributedTo(first: 100, includeUserRepositories: true,
+        contributionTypes: [COMMIT, PULL_REQUEST, PULL_REQUEST_REVIEW]) { nodes { nameWithOwner } } }
+    }
+    fragment R on PullRequest { updatedAt repository { nameWithOwner } }"""
+    d = gh_graphql(q)
+    recent = {}
+    for n in d["a"]["nodes"] + d["r"]["nodes"]:
+        if n:
+            repo = n["repository"]["nameWithOwner"]
+            recent[repo] = max(recent.get(repo, ""), n["updatedAt"])  # ISO timestamps sort as text
+    others = {n["nameWithOwner"] for n in d["viewer"]["repositoriesContributedTo"]["nodes"]} | set(selected)
+    return (sorted(recent, key=recent.get, reverse=True)
+            + sorted(others - set(recent), key=str.lower))
+
+
+apply_config(DEFAULTS)
+
+PR_FIELDS = """
+  number title url isDraft createdAt updatedAt reviewDecision mergeable
+  author { login }
+  repository { nameWithOwner }
+  comments { totalCount }
+  latestOpinionatedReviews(first: 50) { nodes { state author { login __typename } } }
+  reviewThreads { totalCount }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+"""
+
+
+def log(msg):
+    DATA.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    if LOG.stat().st_size > 512_000:  # crude rotation
+        LOG.replace(LOG.with_suffix(".log.1"))
+
+
+def gh_bin():
+    # GUI and launchd processes get a minimal PATH, so also try the usual Homebrew locations
+    return shutil.which("gh") or next(
+        (p for p in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh") if os.access(p, os.X_OK)), None)
+
+
+def gh_run(*args):
+    gh = gh_bin()
+    if not gh:
+        raise RuntimeError("gh not found: install it with `brew install gh`")
+    return subprocess.run([gh, *args], capture_output=True, text=True, timeout=60)
+
+
+def gh_check():
+    if gh_run("auth", "status").returncode:
+        raise RuntimeError("gh is not logged in: run `gh auth login`")
+
+
+def gh_graphql(query):
+    r = gh_run("api", "graphql", "-f", f"query={query}")
+    if r.returncode != 0:
+        raise RuntimeError(f"gh failed: {r.stderr.strip() or r.stdout.strip()}")
+    out = json.loads(r.stdout)
+    if out.get("errors") and not out.get("data"):
+        raise RuntimeError(f"graphql errors: {out['errors']}")
+    return out["data"]
+
+
+def norm(n):
+    ci = None
+    commits = n["commits"]["nodes"]
+    if commits and commits[0]["commit"]["statusCheckRollup"]:
+        ci = commits[0]["commit"]["statusCheckRollup"]["state"]
+    ci = {"SUCCESS": "green", "FAILURE": "red", "ERROR": "red",
+          "PENDING": "pending", "EXPECTED": "pending"}.get(ci, "none")
+    review = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes"}.get(n["reviewDecision"], "pending")
+    return {
+        "key": f"{n['repository']['nameWithOwner']}#{n['number']}",
+        "repo": n["repository"]["nameWithOwner"], "number": n["number"],
+        "title": n["title"], "url": n["url"], "draft": n["isDraft"],
+        "author": (n["author"] or {}).get("login", "ghost"),
+        "created": n["createdAt"], "updated": n["updatedAt"],
+        "review": review, "ci": ci, "mergeable": n["mergeable"],
+        "approvals": len({(r["author"] or {}).get("login") for r in n["latestOpinionatedReviews"]["nodes"]
+                          if r["state"] == "APPROVED" and r["author"] and r["author"]["__typename"] == "User"
+                          and r["author"]["login"] != (n["author"] or {}).get("login")}),
+        "comments": n["comments"]["totalCount"] + n["reviewThreads"]["totalCount"],
+    }
+
+
+def add_stacks(mine):
+    """Stack membership from GitHub's stacks API (not from branch hierarchy)."""
+    for p in mine.values():
+        p["stack"] = None
+    for repo in sorted({p["repo"] for p in mine.values()}):
+        r = gh_run("api", "--paginate", "--slurp", f"repos/{repo}/stacks?per_page=100")
+        if r.returncode != 0:  # stack info is cosmetic: don't fail the whole run
+            log(f"warn: stacks API failed for {repo}: {r.stderr.strip() or r.stdout.strip()}")
+            continue
+        for st in (s for page in json.loads(r.stdout) for s in page if s["open"]):
+            nums = [x["number"] for x in st["pull_requests"] if x["state"] == "open"]
+            if len(nums) < 2:
+                continue
+            for i, n in enumerate(nums):
+                p = mine.get(f"{repo}#{n}")
+                if p:
+                    p["stack"] = {"pos": i + 1, "size": len(nums), "parent": nums[i - 1] if i else None,
+                                  "id": f"{repo}#stack{st['number']}"}
+
+
+def fetch():
+    repos = " ".join(f"repo:{r}" for r in REPOS)
+    q = f"""
+    fragment PR on PullRequest {{ {PR_FIELDS} }}
+    {{
+      viewer {{ login }}
+      needs: search(query: "{repos} is:pr is:open review-requested:@me -author:@me", type: ISSUE, first: 100) {{ nodes {{ ...PR }} }}
+      mine: search(query: "{repos} is:pr is:open author:@me", type: ISSUE, first: 100) {{ nodes {{ ...PR }} }}
+    }}"""
+    d = gh_graphql(q)
+    conv = lambda s: {p["key"]: p for p in (norm(n) for n in d[s]["nodes"] if n)}
+    mine = conv("mine")
+    add_stacks(mine)
+    return d["viewer"]["login"], conv("needs"), mine
+
+
+def final_states(keys, viewer):
+    """For PRs that vanished from the lists: state + whether viewer reviewed."""
+    if not keys:
+        return {}
+    parts = []
+    for i, k in enumerate(keys):
+        repo, num = k.rsplit("#", 1)
+        owner, name = repo.split("/")
+        parts.append(f'p{i}: repository(owner:"{owner}", name:"{name}") {{ pullRequest(number:{int(num)}) '
+                     f'{{ state reviews(last:100) {{ nodes {{ author {{ login }} }} }} }} }}')
+    d = gh_graphql("{" + " ".join(parts) + "}")
+    out = {}
+    for i, k in enumerate(keys):
+        pr = (d.get(f"p{i}") or {}).get("pullRequest")
+        if pr:
+            out[k] = {"state": pr["state"].lower(),
+                      "reviewed": any((r["author"] or {}).get("login") == viewer for r in pr["reviews"]["nodes"])}
+    return out
+
+
+def diff(prev, needs, mine, viewer):
+    """Return list of (title, message, url)."""
+    ev = []
+    pn, pm = prev["needs_review"], prev["mine"]
+    short = lambda p: f"{p['repo'].split('/')[1]}#{p['number']}: {p['title']}"
+
+    for k, p in needs.items():
+        if k not in pn:
+            ev.append(("Review requested", f"{short(p)} (by {p['author']})", p["url"]))
+
+    for k, p in mine.items():
+        o = pm.get(k)
+        if not o:
+            continue
+        if p["review"] != o["review"] and p["review"] == "changes":
+            ev.append(("Changes requested", short(p), p["url"]))
+        if p["approvals"] > o.get("approvals", p["approvals"]):
+            ev.append((f"Approved ({p['approvals']}/{REQUIRED_APPROVALS})", short(p), p["url"]))
+        if p["ci"] != o["ci"]:
+            if p["ci"] == "red":
+                ev.append(("CI failed", short(p), p["url"]))
+            elif p["ci"] == "green" and o["ci"] in ("red", "pending"):
+                ev.append(("CI passed", short(p), p["url"]))
+        if p["mergeable"] == "CONFLICTING" and o["mergeable"] == "MERGEABLE":  # UNKNOWN is transient
+            ev.append(("Merge conflict", short(p), p["url"]))
+        if p["comments"] > o["comments"]:
+            n = p["comments"] - o["comments"]
+            ev.append(("New comments", f"{n} new on {short(p)}", p["url"]))
+
+    gone = [k for k in list(pn) + list(pm) if k not in needs and k not in mine]
+    states = final_states(gone, viewer)
+    for k in gone:
+        p, st = (pn.get(k) or pm.get(k)), states.get(k)
+        if not st:
+            continue
+        if st["state"] in ("merged", "closed"):
+            ev.append((f"PR {st['state']}", short(p), p["url"]))
+        elif k in pn and not st["reviewed"]:  # still open, request withdrawn (not just fulfilled by me)
+            ev.append(("Review request removed", short(p), p["url"]))
+    return ev
+
+
+NATIVE = None  # set by the app when it can post notifications itself
+
+
+def setup_native_notifications(delegate):
+    """Post notifications as PR Radar itself (needs the app bundle's identity). Returns the post function or None."""
+    try:
+        import UserNotifications as un
+    except ImportError:
+        return None
+    center = un.UNUserNotificationCenter.currentNotificationCenter()
+    center.setDelegate_(delegate)  # before launch finishes, or clicks that cold-start the app are dropped
+
+    def answered(granted, err):
+        log(f"notification permission: {'granted' if granted else f'denied ({err})'}")
+        global NATIVE
+        NATIVE = post if granted else None  # denied: fall back to the helper tools
+        welcome = DATA / "welcome-sent"
+        if granted and not welcome.exists():  # once, so a new user sees where notifications come from
+            welcome.touch()
+            post("Notifications are on", "Review requests, approvals, CI and comments will show up here.", "welcome")
+
+    def post(title, msg, ident):
+        c = un.UNMutableNotificationContent.alloc().init()
+        c.setTitle_("PR Radar")
+        c.setSubtitle_(title)
+        c.setBody_(msg)
+        center.addNotificationRequest_withCompletionHandler_(
+            un.UNNotificationRequest.requestWithIdentifier_content_trigger_(ident, c, None),  # same PR: replace
+            lambda err: err and log(f"warn: notification failed: {err}"))
+
+    center.requestAuthorizationWithOptions_completionHandler_(
+        un.UNAuthorizationOptionAlert | un.UNAuthorizationOptionSound, answered)
+    return post
+
+
+def notify(title, msg, url):
+    if NATIVE:
+        return NATIVE(title, msg, url)
+    tn = shutil.which("terminal-notifier") or next(
+        (p for p in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
+         if os.access(p, os.X_OK)), None)
+    if tn:
+        cmd = [tn, "-title", "PR Radar", "-subtitle", title, "-message", msg, "-open", url, "-group", url]
+    else:
+        cmd = ["osascript", "-e",
+               "on run argv\ndisplay notification (item 1 of argv) with title \"PR Radar\" subtitle (item 2 of argv)\nend run",
+               msg, title]
+    subprocess.run(cmd, capture_output=True, timeout=15)
+
+
+# ---- dashboard --------------------------------------------------------------
+CSS = """
+:root{--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--mut:#656d76;--bd:#d0d7de;--green:#1a7f37;--red:#cf222e;--amber:#9a6700;--blue:#0969da;--gray:#6e7781}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8d96a0;--bd:#30363d;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--gray:#8b949e}}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;max-width:960px;margin-inline:auto}
+header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:28px 0 8px}h2 span{color:var(--mut);font-weight:400}
+.mut{color:var(--mut)}.pr{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:10px 14px;margin-bottom:8px}
+.pr a.t{color:var(--fg);font-weight:600;text-decoration:none}.pr a.t:hover{color:var(--blue);text-decoration:underline}
+.stack{border:1px solid var(--blue);border-radius:8px;padding:8px 8px 0;margin-bottom:8px}.stack .pr{margin-left:12px}.sh{color:var(--blue);font-size:12px;font-weight:600;margin:0 0 8px 4px}
+@media(min-width:800px){body{max-width:1600px}.cols{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start}.cols h2{margin-top:20px}}
+.cols>div{min-width:0}
+.msg{max-width:520px;margin:80px auto;text-align:center}.msg button{font:inherit;margin-top:8px;padding:6px 16px;border-radius:6px;border:1px solid var(--bd);background:var(--card);color:var(--fg)}.msg h2{font-size:18px}.err{color:var(--red);font-size:12px;margin:8px 0 0}
+.spin{display:inline-block;width:8px;height:8px;margin-right:5px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.spin{animation-duration:3s}}
+.meta{color:var(--mut);font-size:12px;margin:2px 0 6px}
+.b{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;border:1px solid currentColor;margin-right:4px}
+.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.gray{color:var(--gray)}.blue{color:var(--blue)}
+"""
+
+JS = """
+function ago(t){var s=(Date.now()-new Date(t))/1000;if(s<90)return'just now';var m=s/60;if(m<60)return Math.round(m)+'m ago';
+var h=m/60;if(h<48)return Math.round(h)+'h ago';return Math.round(h/24)+'d ago'}
+function tick(){document.querySelectorAll('time[datetime]').forEach(function(e){e.textContent=ago(e.dateTime)})}
+tick();setInterval(tick,60000);
+function chooseRepos(el){var r=el.getBoundingClientRect();window.webkit.messageHandlers.app.postMessage({x:r.left,y:r.bottom})}
+function update(h){document.getElementById('app').innerHTML=h;tick()}
+"""
+
+
+def badge(text, cls, spinner=False):
+    spin = '<i class="spin"></i>' if spinner else ""
+    return f'<span class="b {cls}">{spin}{html.escape(text)}</span>'
+
+
+def card(p, show_author):
+    e = html.escape
+    b = []
+    if p["draft"]:
+        b.append(badge("draft", "gray"))
+    if "approvals" in p and not show_author:
+        n = p["approvals"]
+        b.append(badge(f"{n}/{REQUIRED_APPROVALS} approvals", "green" if n >= REQUIRED_APPROVALS else "amber"))
+    st = p.get("stack")
+    if st:
+        on = f" · on #{st['parent']}" if st["parent"] else " · base"
+        b.append(badge(f"stack {st['pos']}/{st['size']}{on}", "blue"))
+    if p["review"] == "changes":
+        b.append(badge("changes requested", "red"))
+    b.append({"green": badge("CI passing", "green"), "red": badge("CI failing", "red"),
+              "pending": badge("CI running", "amber", spinner=True), "none": badge("no CI", "gray")}[p["ci"]])
+    if p["mergeable"] == "CONFLICTING":
+        b.append(badge("merge conflict", "red"))
+    b.append(badge(f"{p['comments']} comment{'s' if p['comments'] != 1 else ''}", "gray"))
+    who = f"by {e(p['author'])} · " if show_author else ""
+    return (f'<div class="pr"><a class="t" href="{e(p["url"])}">{e(p["title"])}</a>'
+            f'<div class="meta">{e(p["repo"])}#{p["number"]} · {who}opened <time datetime="{p["created"]}">{p["created"]}</time>'
+            f' · updated <time datetime="{p["updated"]}">{p["updated"]}</time></div>{"".join(b)}</div>')
+
+
+def render_body(viewer, needs, mine, fetched_at):
+    def section(title, prs, show_author):
+        items = sorted(prs.values(), key=lambda p: p["updated"], reverse=True)
+        if show_author:  # Needs my review: one box per repo, ordered by latest activity
+            repos = {}
+            for p in items:
+                repos.setdefault(p["repo"], []).append(p)
+            body = "".join(f'<div class="stack"><div class="sh">{html.escape(repo)} · {len(g)} PR{"s" if len(g) != 1 else ""}</div>'
+                           + "".join(card(q, True) for q in g) + "</div>" for repo, g in repos.items())
+            return f'<h2>{title} <span>({len(items)})</span></h2>{body or "<p class=mut>Nothing here.</p>"}'
+        stacks = {}
+        for p in items:
+            if p.get("stack"):
+                stacks.setdefault(p["stack"]["id"], []).append(p)
+        blocks, done = [], set()
+        for p in items:  # groups and standalone PRs interleaved by latest activity
+            sid = p.get("stack") and p["stack"]["id"]
+            if not sid:
+                blocks.append(card(p, show_author))
+            elif sid not in done:
+                done.add(sid)
+                grp = sorted(stacks[sid], key=lambda q: (q["stack"]["pos"], q["number"]))
+                blocks.append(f'<div class="stack"><div class="sh">Stack · {html.escape(grp[0]["repo"])} · {len(grp)} PRs</div>'
+                              + "".join(card(q, show_author) for q in grp) + "</div>")
+        body = "".join(blocks) or '<p class="mut">Nothing here.</p>'
+        return f'<h2>{title} <span>({len(items)})</span></h2>{body}'
+    return f"""<header><h1>PR Radar <span class="mut">@{html.escape(viewer)}</span></h1>
+<span class="mut">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M}</span></header>
+<div class="cols"><div>{section("My PRs", mine, False)}</div><div>{section("Needs my review", needs, True)}</div></div>"""
+
+
+def message(title, text, spinner=False, extra=""):
+    spin = '<i class="spin"></i>' if spinner else ""
+    return f'<div class="msg"><h2>{spin}{html.escape(title)}</h2><p class="mut">{text}</p>{extra}</div>'
+
+
+def page(body):
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>PR Radar</title><style>{CSS}</style></head><body>
+<div id="app">{body}</div>
+<script>{JS}</script></body></html>"""
+
+
+def write_atomic(path, text):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+# ---- main -------------------------------------------------------------------
+def in_work_hours():
+    now = datetime.now(TZ)
+    return now.weekday() in WORK_DAYS and WORK_HOURS[0] <= now.hour < WORK_HOURS[1]
+
+
+STATE = {"needs": None, "mine": None, "at": None, "error": None, "body": None}  # last run, shown by the app
+
+
+def run(open_dashboard):
+    DATA.mkdir(parents=True, exist_ok=True)
+    try:
+        viewer, needs, mine = fetch()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        events = []
+        if SNAPSHOT.exists():
+            prev = json.loads(SNAPSHOT.read_text())
+            known = set(prev.get("repos", REPOS))  # snapshots from before repos were recorded watched all current ones
+            prev["needs_review"] = {k: p for k, p in prev["needs_review"].items() if p["repo"] in REPOS}
+            prev["mine"] = {k: p for k, p in prev["mine"].items() if p["repo"] in REPOS}
+            for key, cur in (("needs_review", needs), ("mine", mine)):  # newly added repos: baseline, don't notify
+                prev[key].update({k: p for k, p in cur.items() if p["repo"] not in known})
+            events = diff(prev, needs, mine, viewer)
+        else:
+            log("first run: recording baseline, no notifications")
+        body = render_body(viewer, needs, mine, now)
+        write_atomic(SNAPSHOT, json.dumps({"fetched_at": now, "repos": REPOS, "needs_review": needs, "mine": mine}, indent=1))
+        write_atomic(DASHBOARD, page(body))
+        FAILS.unlink(missing_ok=True)
+        for title, msg, url in events:
+            log(f"notify: {title} | {msg}")
+            notify(title, msg, url)
+        log(f"ok: {len(needs)} to review, {len(mine)} mine, {len(events)} events")
+        STATE.update(needs=len(needs), mine=len(mine), at=datetime.now(TZ), error=None, body=body)
+    except Exception as e:  # noqa: BLE001
+        STATE["error"] = str(e)
+        log(f"ERROR: {e}")
+        n = int(FAILS.read_text() or 0) + 1 if FAILS.exists() else 1
+        FAILS.write_text(str(n))
+        if n == FAIL_NOTIFY_AFTER:
+            notify("PR Radar is failing", f"{n} failed runs in a row; see pr-radar.log", "failing")
+        if open_dashboard:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+    if open_dashboard:
+        subprocess.run(["open", str(DASHBOARD)])
+    return 0
+
+
+# ---- the app ----------------------------------------------------------------
+def in_app_bundle():
+    return os.environ.get("RESOURCEPATH", "").endswith(".app/Contents/Resources")  # set by the py2app launcher
+
+
+def install_app():
+    """Build ~/Applications/PR Radar.app (py2app alias bundle pointing at this checkout).
+
+    It has to be a real bundle running as its own process: a shell launcher that execs python is registered
+    as "Python", and macOS then hides its menu bar item and attributes notifications to Python.
+    """
+    python = ROOT / ".venv/bin/python"
+    python = python if python.exists() else Path(sys.executable)
+    if subprocess.run([python, "-c", "import py2app"], capture_output=True).returncode:
+        print("building the app needs py2app: pip install -r requirements.txt", file=sys.stderr)
+        return 1
+    shutil.rmtree(APP_BUNDLE, ignore_errors=True)
+    setup = f"""from setuptools import setup
+setup(name="PR Radar", app=[{str(SCRIPT)!r}], options={{"py2app": {{"alias": True, "plist": {{
+    "CFBundleName": "PR Radar", "CFBundleIdentifier": {APP_ID!r}, "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0"}}}}}})
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "setup.py").write_text(setup)
+        r = subprocess.run([python, "setup.py", "py2app", "-A", "--dist-dir", str(APP_BUNDLE.parent)],
+                           cwd=tmp, capture_output=True, text=True)
+    if r.returncode or not APP_BUNDLE.exists():
+        print(r.stdout[-2000:] + r.stderr[-2000:], file=sys.stderr)
+        return 1
+    lsregister = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework"
+                  "/Support/lsregister")
+    subprocess.run([lsregister, "-f", str(APP_BUNDLE)], capture_output=True)  # drop LaunchServices' cached Info.plist
+    print(f"created {APP_BUNDLE}")
+    return 0
+
+
+def launch_app():
+    if not APP_BUNDLE.exists() and install_app():
+        return 1
+    subprocess.run(["open", str(APP_BUNDLE)])
+    return 0
+
+
+def gui():
+    """The app: a window showing the dashboard in a web view, plus a Repos menu. Runs inside the app bundle."""
+    import struct
+    from AppKit import (NSAlert, NSApplication, NSApplicationActivationPolicyRegular, NSBackingStoreBuffered, NSMenu,
+                        NSMenuItem, NSTextField, NSWindow, NSWindowStyleMaskClosable, NSWindowStyleMaskMiniaturizable,
+                        NSWindowStyleMaskResizable, NSWindowStyleMaskTitled, NSWorkspace)
+    from Foundation import NSAppleEventManager, NSMakePoint, NSMakeRect, NSObject, NSTimer, NSURL
+    from PyObjCTools import AppHelper
+    from WebKit import WKWebView, WKWebViewConfiguration
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    sys.stdout = sys.stderr = LOG.open("a", buffering=1)  # a bundled app has no terminal: tracebacks go to the log
+    load_config()
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    ui = {"window": None, "web": None, "repos_menu": None, "cands": None, "hidden": False,
+          "loading": False, "again": False}  # loading: repos just changed; again: poll once more after the current one
+    busy = threading.Lock()
+    fourcc = lambda s: struct.unpack(">I", s.encode())[0]
+
+    def launched_at_login():  # only valid while the launch event is being handled
+        event = NSAppleEventManager.sharedAppleEventManager().currentAppleEvent()
+        prop = event.paramDescriptorForKeyword_(fourcc("prdt")) if event else None
+        return bool(prop) and prop.enumCodeValue() == fourcc("lgit")
+
+    def show_window():
+        if ui["window"]:
+            ui["window"].makeKeyAndOrderFront_(None)
+            app.activateIgnoringOtherApps_(True)
+
+    def open_external(url):
+        NSWorkspace.sharedWorkspace().openURL_(url)
+
+    def push():  # main thread: bring the page and the Dock badge in line with STATE
+        body = None
+        if not REPOS:
+            body = message("Choose the repos to watch", "Tick the repos you care about in the <b>Repos</b> menu.",
+                           extra='<button onclick="chooseRepos(this)">Choose repos…</button>')
+        elif ui["loading"]:
+            body = message("Loading…", "Fetching your pull requests.", spinner=True)
+        elif STATE["error"]:
+            err = f'<p class="err">{html.escape(STATE["error"][:300])}</p>'
+            body = err + STATE["body"] if STATE["body"] else message("Couldn't load your PRs", html.escape(STATE["error"][:300]))
+        elif STATE["body"]:
+            body = STATE["body"]
+        if body is not None and ui["web"]:
+            ui["web"].evaluateJavaScript_completionHandler_(f"update({json.dumps(body)})", None)
+        n = STATE["needs"]
+        app.dockTile().setBadgeLabel_(str(n) if REPOS and n and not STATE["error"] else None)
+
+    def refresh(force=False):
+        if not REPOS or not (force or in_work_hours()):
+            return
+
+        def work():
+            if not busy.acquire(blocking=False):
+                ui["again"] = ui["again"] or force  # a repo change mustn't be lost to a poll already in flight
+                return
+            try:
+                while True:
+                    ui["again"] = False
+                    run(False)
+                    if not ui["again"]:
+                        break
+            finally:
+                busy.release()
+            ui["loading"] = False
+            AppHelper.callAfter(push)
+        threading.Thread(target=work, daemon=True).start()
+
+    def load_cands():
+        def work():
+            try:
+                ui["cands"] = candidate_repos(REPOS)
+            except RuntimeError as e:
+                log(f"warn: couldn't list repos: {e}")
+                ui["cands"] = list(REPOS)
+            AppHelper.callAfter(rebuild_repos_menu)
+        threading.Thread(target=work, daemon=True).start()
+
+    def rebuild_repos_menu():
+        m = ui["repos_menu"]
+        m.removeAllItems()
+        if ui["cands"] is None:
+            m.addItemWithTitle_action_keyEquivalent_("Loading…", None, "")  # no action: greyed out
+        for r in (ui["cands"] or [])[:40]:  # newest activity first, then alphabetical
+            item = m.addItemWithTitle_action_keyEquivalent_(r, "toggleRepo:", "")
+            item.setTarget_(delegate)
+            item.setState_(1 if r in REPOS else 0)
+        m.addItem_(NSMenuItem.separatorItem())
+        for title, action in (("Add other repo…", "addRepo:"), ("Reload list", "reloadRepos:")):
+            m.addItemWithTitle_action_keyEquivalent_(title, action, "").setTarget_(delegate)
+
+    def set_repos(repos):
+        save_repos(repos)
+        rebuild_repos_menu()
+        ui["loading"] = bool(REPOS)
+        push()  # show "Loading…" at once instead of the old repos' PRs
+        refresh(force=True)
+
+    def alert(title, text, field=False, ok="OK"):
+        a = NSAlert.alloc().init()
+        a.setMessageText_(title)
+        a.setInformativeText_(text)
+        a.addButtonWithTitle_(ok)
+        if field:
+            a.addButtonWithTitle_("Cancel")
+            tf = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 24))
+            a.setAccessoryView_(tf)
+            a.window().setInitialFirstResponder_(tf)
+        app.activateIgnoringOtherApps_(True)
+        clicked_ok = a.runModal() == 1000
+        return str(tf.stringValue()).strip() if field and clicked_ok else None
+
+    def add_repo():
+        msg = "Repo to add (owner/name):"
+        while True:
+            repo = alert("Add a repo", msg, field=True, ok="Add")
+            if not repo:
+                return
+            problems = check_repos([repo])
+            if not problems:
+                break
+            msg = f"{problems[0]}\n\nRepo to add (owner/name):"
+        if repo not in (ui["cands"] or []):
+            ui["cands"] = (ui["cands"] or []) + [repo]
+        if repo not in REPOS:
+            set_repos(REPOS + [repo])
+
+    def toggle_repo(repo):
+        repos = [r for r in REPOS if r != repo] + ([] if repo in REPOS else [repo])
+        if not repos:
+            alert("Keep at least one repo", "PR Radar needs a repo to watch.")
+            rebuild_repos_menu()  # the click flipped the checkmark
+            return
+        set_repos(repos)
+
+    class Delegate(NSObject):
+        def applicationWillFinishLaunching_(self, note):
+            ui["hidden"] = launched_at_login()
+            global NATIVE
+            NATIVE = setup_native_notifications(self)
+
+        def applicationDidFinishLaunching_(self, note):
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+                     | NSWindowStyleMaskResizable)
+            w = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(NSMakeRect(0, 0, 1180, 820), style, NSBackingStoreBuffered, False)
+            w.setTitle_("PR Radar")
+            w.setReleasedWhenClosed_(False)  # closing hides it; the app keeps polling
+            if not w.setFrameUsingName_("PRRadarMain"):
+                w.center()
+            w.setFrameAutosaveName_("PRRadarMain")
+            config = WKWebViewConfiguration.alloc().init()
+            config.userContentController().addScriptMessageHandler_name_(self, "app")  # the page's "Choose repos" button
+            web = WKWebView.alloc().initWithFrame_configuration_(w.contentView().bounds(), config)
+            web.setAutoresizingMask_(18)  # width + height sizable
+            web.setNavigationDelegate_(self)
+            web.setUIDelegate_(self)
+            w.setContentView_(web)
+            ui["window"], ui["web"] = w, web
+            if DASHBOARD.exists():  # last known state straight away, then live updates through update()
+                web.loadFileURL_allowingReadAccessToURL_(NSURL.fileURLWithPath_(str(DASHBOARD)), NSURL.fileURLWithPath_(str(DATA)))
+            else:
+                web.loadHTMLString_baseURL_(page(message("Loading…", "Fetching your pull requests.")), None)
+            self.buildMenus()
+            if not ui["hidden"]:
+                show_window()
+            timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(POLL_SECONDS, self, "poll:", None, True)
+            timer.setTolerance_(POLL_SECONDS * 0.2)  # no activity assertion: macOS may delay or coalesce polls (App Nap)
+            load_cands()
+            refresh(force=True)
+
+        def buildMenus(self):
+            main = NSMenu.alloc().initWithTitle_("")
+
+            def submenu(title):
+                item = main.addItemWithTitle_action_keyEquivalent_(title, None, "")
+                m = NSMenu.alloc().initWithTitle_(title)
+                item.setSubmenu_(m)
+                return m
+
+            def add(m, title, action, key="", target=None):
+                item = m.addItemWithTitle_action_keyEquivalent_(title, action, key)
+                if target:
+                    item.setTarget_(target)
+
+            m = submenu("PR Radar")
+            add(m, "About PR Radar", "orderFrontStandardAboutPanel:")
+            m.addItem_(NSMenuItem.separatorItem())
+            add(m, "Hide PR Radar", "hide:", "h")
+            m.addItem_(NSMenuItem.separatorItem())
+            add(m, "Quit PR Radar", "terminate:", "q")
+            m = submenu("Edit")
+            add(m, "Copy", "copy:", "c")
+            add(m, "Select All", "selectAll:", "a")
+            add(submenu("View"), "Refresh", "refreshNow:", "r", self)
+            ui["repos_menu"] = submenu("Repos")
+            rebuild_repos_menu()
+            m = submenu("Window")
+            add(m, "Minimize", "performMiniaturize:", "m")
+            add(m, "Close", "performClose:", "w")
+            app.setWindowsMenu_(m)
+            app.setMainMenu_(main)
+
+        # app lifecycle
+        def applicationShouldTerminateAfterLastWindowClosed_(self, app_):
+            return False
+
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app_, visible):
+            show_window()
+            return True
+
+        def applicationDidBecomeActive_(self, note):
+            if STATE["at"] is None or (datetime.now(TZ) - STATE["at"]).total_seconds() > POLL_SECONDS:
+                refresh()
+
+        def poll_(self, timer):
+            refresh()
+
+        # menu actions
+        def refreshNow_(self, sender):
+            refresh(force=True)
+
+        def toggleRepo_(self, sender):
+            toggle_repo(str(sender.title()))
+
+        def addRepo_(self, sender):
+            add_repo()
+
+        def reloadRepos_(self, sender):
+            ui["cands"] = None
+            rebuild_repos_menu()
+            load_cands()
+
+        def userContentController_didReceiveScriptMessage_(self, controller, msg):
+            at = msg.body()  # where the button is, in page coordinates (the web view is flipped, like the page)
+            ui["repos_menu"].popUpMenuPositioningItem_atLocation_inView_(None, NSMakePoint(float(at["x"]), float(at["y"])), ui["web"])
+
+        # web view: the page is ours, everything else opens in the default browser
+        def webView_didFinishNavigation_(self, web, nav):
+            push()
+
+        def webView_decidePolicyForNavigationAction_decisionHandler_(self, web, action, handler):
+            if action.navigationType() == 0:  # a clicked link
+                open_external(action.request().URL())
+                handler(0)  # cancel
+            else:
+                handler(1)  # allow
+
+        def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(self, web, config, action, features):
+            open_external(action.request().URL())  # target=_blank
+            return None
+
+        # notifications: show them while we're frontmost too, and a click brings the dashboard forward
+        def userNotificationCenter_willPresentNotification_withCompletionHandler_(self, center, note, done):
+            done(0b1110)  # banner | list | sound
+
+        def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(self, center, resp, done):
+            AppHelper.callAfter(show_window)
+            done()
+
+    delegate = Delegate.alloc().init()
+    app.setDelegate_(delegate)
+    app.run()
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["install-app"]:
+        return install_app()
+    if not args:
+        return gui() if in_app_bundle() else launch_app()
+    if set(args) <= {"--once", "--open"} and "--once" in args:
+        load_config()
+        if not REPOS:
+            print("no repos configured: open PR Radar and pick some in the Repos menu", file=sys.stderr)
+            return 1
+        return run("--open" in args)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
