@@ -47,25 +47,35 @@ def local_timezone():
         return "UTC"
 
 
+SORTS = {  # View > Sort By; also how PRs are ordered inside each group on the dashboard
+    "updated": "Activity: latest first",
+    "updated-asc": "Activity: oldest first",
+    "created": "Date opened: latest first",
+    "created-asc": "Date opened: oldest first",
+    "milestone": "Milestone",
+}
+
 DEFAULTS = {
     "repos": [],                       # "owner/name" entries; picked in the Repos menu
     "timezone": local_timezone(),
     "work_days": [0, 1, 2, 3, 4],      # Mon-Fri (0 = Monday)
     "work_hours": [8, 19],             # 08:00 <= now < 19:00 in `timezone`
     "poll_seconds": 300,               # how often the app polls GitHub (macOS may stretch this when the app is idle)
+    "sort": "updated",                 # View > Sort By: updated, updated-asc, created, created-asc or milestone
     "required_approvals": 2,           # human approvals needed before merge
     "fail_notify_after": 6,            # one notification after this many consecutive failures
 }
 
 
 def apply_config(cfg):
-    global REPOS, TZ, WORK_DAYS, WORK_HOURS, POLL_SECONDS, REQUIRED_APPROVALS, FAIL_NOTIFY_AFTER
+    global REPOS, TZ, WORK_DAYS, WORK_HOURS, POLL_SECONDS, REQUIRED_APPROVALS, FAIL_NOTIFY_AFTER, SORT
     REPOS = list(cfg["repos"])
     TZ = ZoneInfo(cfg["timezone"])
     WORK_DAYS = list(cfg["work_days"])
     WORK_HOURS = tuple(cfg["work_hours"])
     POLL_SECONDS = cfg["poll_seconds"]
     REQUIRED_APPROVALS = cfg["required_approvals"]
+    SORT = cfg["sort"] if cfg["sort"] in SORTS else "updated"
     FAIL_NOTIFY_AFTER = cfg["fail_notify_after"]
 
 
@@ -77,14 +87,18 @@ def load_config():
     return cfg
 
 
-def save_repos(repos):
+def save_settings(**changes):
     cfg = dict(DEFAULTS)
     if CONFIG.exists():
         cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
-    cfg["repos"] = repos
+    cfg.update(changes)
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     apply_config(cfg)
+
+
+def save_repos(repos):
+    save_settings(repos=repos)
 
 
 REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -414,12 +428,34 @@ def card(p, show_author):
             f' · updated <time datetime="{p["updated"]}">{p["updated"]}</time></div>{"".join(b)}</div>')
 
 
+def natural(text):  # "2.10.0" after "2.9.0"
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t.lower()) for t in re.split(r"(\d+)", text) if t]
+
+
+def milestone_key(p):  # earliest due date first, then release number; PRs without a milestone last
+    m = p.get("milestone")
+    return (0, m["due"] or "9999", natural(m["title"])) if m else (1,)
+
+
+def sort_units(units, mode):
+    """Order PRs for display. A unit is one PR or a whole stack, which always stays together.
+
+    A stack is dated by its most recent PR; for milestone order it takes the earliest milestone among its PRs.
+    """
+    if mode == "milestone":
+        units = sorted(units, key=lambda u: max(p["updated"] for p in u), reverse=True)  # ties: latest activity first
+        return sorted(units, key=lambda u: min(milestone_key(p) for p in u))
+    field, newest_first = {"updated": ("updated", True), "updated-asc": ("updated", False),
+                           "created": ("created", True), "created-asc": ("created", False)}[mode]
+    return sorted(units, key=lambda u: max(p[field] for p in u), reverse=newest_first)
+
+
 def render_body(viewer, needs, mine, fetched_at):
     def section(title, prs, show_author):
-        items = sorted(prs.values(), key=lambda p: p["updated"], reverse=True)
-        if show_author:  # Needs my review: one box per repo, ordered by latest activity
+        items = list(prs.values())
+        if show_author:  # Needs my review: one box per repo; boxes follow their first PR in the chosen order
             repos = {}
-            for p in items:
+            for (p,) in sort_units([[p] for p in items], SORT):
                 repos.setdefault(p["repo"], []).append(p)
             body = "".join(f'<div class="stack"><div class="sh">{html.escape(repo)} · {len(g)} PR{"s" if len(g) != 1 else ""}</div>'
                            + "".join(card(q, True) for q in g) + "</div>" for repo, g in repos.items())
@@ -428,20 +464,19 @@ def render_body(viewer, needs, mine, fetched_at):
         for p in items:
             if p.get("stack"):
                 stacks.setdefault(p["stack"]["id"], []).append(p)
-        blocks, done = [], set()
-        for p in items:  # groups and standalone PRs interleaved by latest activity
-            sid = p.get("stack") and p["stack"]["id"]
-            if not sid:
-                blocks.append(card(p, show_author))
-            elif sid not in done:
-                done.add(sid)
-                grp = sorted(stacks[sid], key=lambda q: (q["stack"]["pos"], q["number"]))
+        units = [[p] for p in items if not p.get("stack")] + list(stacks.values())
+        blocks = []
+        for u in sort_units(units, SORT):  # standalone PRs and whole stacks, interleaved
+            if not u[0].get("stack"):
+                blocks.append(card(u[0], show_author))
+            else:
+                grp = sorted(u, key=lambda q: (q["stack"]["pos"], q["number"]))
                 blocks.append(f'<div class="stack"><div class="sh">Stack · {html.escape(grp[0]["repo"])} · {len(grp)} PRs</div>'
                               + "".join(card(q, show_author) for q in grp) + "</div>")
         body = "".join(blocks) or '<p class="mut">Nothing here.</p>'
         return f'<h2>{title} <span>({len(items)})</span></h2>{body}'
     return f"""<header><h1>PR Radar <span class="mut">@{html.escape(viewer)}</span></h1>
-<span class="mut">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M}</span></header>
+<span class="mut">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M} · sorted by {SORTS[SORT].lower().replace(': ', ', ')}</span></header>
 <div class="cols"><div>{section("My PRs", mine, False)}</div><div>{section("Needs my review", needs, True)}</div></div>"""
 
 
@@ -470,7 +505,7 @@ def in_work_hours():
     return now.weekday() in WORK_DAYS and WORK_HOURS[0] <= now.hour < WORK_HOURS[1]
 
 
-STATE = {"needs": None, "mine": None, "at": None, "error": None, "body": None}  # last run, shown by the app
+STATE = {"needs": None, "mine": None, "at": None, "error": None, "body": None, "data": None}  # last run, shown by the app
 
 
 def run(open_dashboard):
@@ -497,7 +532,8 @@ def run(open_dashboard):
             log(f"notify: {title} | {msg}")
             notify(title, msg, url)
         log(f"ok: {len(needs)} to review, {len(mine)} mine, {len(events)} events")
-        STATE.update(needs=len(needs), mine=len(mine), at=datetime.now(TZ), error=None, body=body)
+        STATE.update(needs=len(needs), mine=len(mine), at=datetime.now(TZ), error=None, body=body,
+                     data=(viewer, needs, mine, now))
     except Exception as e:  # noqa: BLE001
         STATE["error"] = str(e)
         log(f"ERROR: {e}")
@@ -511,6 +547,13 @@ def run(open_dashboard):
     if open_dashboard:
         subprocess.run(["open", str(DASHBOARD)])
     return 0
+
+
+def rerender():
+    """Redraw the last fetched data, e.g. after the sort order changed."""
+    if STATE["data"]:
+        STATE["body"] = render_body(*STATE["data"])
+        write_atomic(DASHBOARD, page(STATE["body"]))
 
 
 # ---- the app ----------------------------------------------------------------
@@ -689,6 +732,16 @@ def gui():
         for title, action in (("Add other repo…", "addRepo:"), ("Reload list", "reloadRepos:")):
             m.addItemWithTitle_action_keyEquivalent_(title, action, "").setTarget_(delegate)
 
+    def check_sort():
+        for item in ui["sort_menu"].itemArray():
+            item.setState_(1 if str(item.representedObject()) == SORT else 0)
+
+    def set_sort(mode):
+        save_settings(sort=mode)
+        check_sort()
+        rerender()
+        push()
+
     def set_repos(repos):
         save_repos(repos)
         rebuild_repos_menu()
@@ -791,7 +844,17 @@ def gui():
             m = submenu("Edit")
             add(m, "Copy", "copy:", "c")
             add(m, "Select All", "selectAll:", "a")
-            add(submenu("View"), "Refresh", "refreshNow:", "r", self)
+            view = submenu("View")
+            add(view, "Refresh", "refreshNow:", "r", self)
+            view.addItem_(NSMenuItem.separatorItem())
+            sort_item = view.addItemWithTitle_action_keyEquivalent_("Sort By", None, "")
+            ui["sort_menu"] = NSMenu.alloc().initWithTitle_("Sort By")
+            sort_item.setSubmenu_(ui["sort_menu"])
+            for mode, label in SORTS.items():
+                item = ui["sort_menu"].addItemWithTitle_action_keyEquivalent_(label, "setSort:", "")
+                item.setTarget_(self)
+                item.setRepresentedObject_(mode)
+            check_sort()
             ui["repos_menu"] = submenu("Repos")
             rebuild_repos_menu()
             m = submenu("Window")
@@ -818,6 +881,9 @@ def gui():
         # menu actions
         def refreshNow_(self, sender):
             refresh(force=True)
+
+        def setSort_(self, sender):
+            set_sort(str(sender.representedObject()))
 
         def toggleRepo_(self, sender):
             toggle_repo(str(sender.title()))
