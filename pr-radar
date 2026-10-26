@@ -378,6 +378,7 @@ h1{font-size:20px;margin:0}h2{font-size:16px;margin:28px 0 8px}h2 span{color:var
 @media(prefers-reduced-motion:reduce){.spin{animation-duration:3s}}
 .meta{color:var(--mut);font-size:12px;margin:2px 0 6px}
 .b{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;border:1px solid currentColor;margin-right:4px}
+.busy-only{display:none}body.busy .busy-only{display:inline}body.busy .idle-only{display:none}
 .b{text-decoration:none}a.b:hover{text-decoration:underline}
 .purple{color:var(--purple)}.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.gray{color:var(--gray)}.blue{color:var(--blue)}
 """
@@ -388,6 +389,7 @@ var h=m/60;if(h<48)return Math.round(h)+'h ago';return Math.round(h/24)+'d ago'}
 function tick(){document.querySelectorAll('time[datetime]').forEach(function(e){e.textContent=ago(e.dateTime)})}
 tick();setInterval(tick,60000);
 function chooseRepos(el){var r=el.getBoundingClientRect();window.webkit.messageHandlers.app.postMessage({x:r.left,y:r.bottom})}
+function setBusy(b){document.body.classList.toggle('busy',b)}
 function update(h){document.getElementById('app').innerHTML=h;tick()}
 """
 
@@ -476,7 +478,7 @@ def render_body(viewer, needs, mine, fetched_at):
         body = "".join(blocks) or '<p class="mut">Nothing here.</p>'
         return f'<h2>{title} <span>({len(items)})</span></h2>{body}'
     return f"""<header><h1>PR Radar <span class="mut">@{html.escape(viewer)}</span></h1>
-<span class="mut">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M} · sorted by {SORTS[SORT].lower().replace(': ', ', ')}</span></header>
+<span class="mut"><span class="idle-only">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M} · sorted by {SORTS[SORT].lower().replace(': ', ', ')}</span><span class="busy-only"><i class="spin"></i>Refreshing…</span></span></header>
 <div class="cols"><div>{section("My PRs", mine, False)}</div><div>{section("Needs my review", needs, True)}</div></div>"""
 
 
@@ -593,6 +595,7 @@ def install_app():
     if subprocess.run([python, "-m", "pip", "install", "-q", "--disable-pip-version-check",
                        "-r", str(INSTALL / "requirements.txt")]).returncode:
         return 1
+    DASHBOARD.unlink(missing_ok=True)  # the app shows this cached page first; its old CSS/JS would outlive the update
     step(f"Building {APP_BUNDLE}")
     shutil.rmtree(APP_BUNDLE, ignore_errors=True)
     setup = f"""from setuptools import setup
@@ -655,7 +658,7 @@ def gui():
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
     ui = {"window": None, "web": None, "repos_menu": None, "cands": None, "hidden": False,
-          "loading": False, "again": False}  # loading: repos just changed; again: poll once more after the current one
+          "loading": False, "again": False, "busy": False}  # loading: repos just changed; again: poll once more after the current one
     busy = threading.Lock()
     fourcc = lambda s: struct.unpack(">I", s.encode())[0]
 
@@ -672,6 +675,11 @@ def gui():
     def open_external(url):
         NSWorkspace.sharedWorkspace().openURL_(url)
 
+    def set_busy(on):  # main thread: swap the header's "last refreshed" for a spinner while polling
+        ui["busy"] = on
+        if ui["web"]:
+            ui["web"].evaluateJavaScript_completionHandler_(f"setBusy({json.dumps(on)})", None)
+
     def push():  # main thread: bring the page and the Dock badge in line with STATE
         body = None
         if not REPOS:
@@ -686,8 +694,14 @@ def gui():
             body = STATE["body"]
         if body is not None and ui["web"]:
             ui["web"].evaluateJavaScript_completionHandler_(f"update({json.dumps(body)})", None)
+        set_busy(ui["busy"])  # a fresh page starts idle, and the page may load after a poll began
         n = STATE["needs"]
         app.dockTile().setBadgeLabel_(str(n) if REPOS and n and not STATE["error"] else None)
+
+    def finish():  # main thread, after a poll: this runs after the matching set_busy(True), so the order holds
+        ui["loading"] = False
+        ui["busy"] = False
+        push()
 
     def refresh(force=False):
         if not REPOS or not (force or in_work_hours()):
@@ -697,6 +711,7 @@ def gui():
             if not busy.acquire(blocking=False):
                 ui["again"] = ui["again"] or force  # a repo change mustn't be lost to a poll already in flight
                 return
+            AppHelper.callAfter(set_busy, True)
             try:
                 while True:
                     ui["again"] = False
@@ -705,8 +720,7 @@ def gui():
                         break
             finally:
                 busy.release()
-            ui["loading"] = False
-            AppHelper.callAfter(push)
+            AppHelper.callAfter(finish)
         threading.Thread(target=work, daemon=True).start()
 
     def load_cands():
