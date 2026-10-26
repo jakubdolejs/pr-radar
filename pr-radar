@@ -128,6 +128,7 @@ apply_config(DEFAULTS)
 
 PR_FIELDS = """
   number title url isDraft createdAt updatedAt reviewDecision mergeable
+  milestone { title url dueOn }
   author { login }
   repository { nameWithOwner }
   comments { totalCount }
@@ -188,6 +189,8 @@ def norm(n):
         "author": (n["author"] or {}).get("login", "ghost"),
         "created": n["createdAt"], "updated": n["updatedAt"],
         "review": review, "ci": ci, "mergeable": n["mergeable"],
+        "milestone": n["milestone"] and {"title": n["milestone"]["title"], "url": n["milestone"]["url"],
+                                         "due": n["milestone"]["dueOn"]},
         "approvals": len({(r["author"] or {}).get("login") for r in n["latestOpinionatedReviews"]["nodes"]
                           if r["state"] == "APPROVED" and r["author"] and r["author"]["__typename"] == "User"
                           and r["author"]["login"] != (n["author"] or {}).get("login")}),
@@ -345,8 +348,8 @@ def notify(title, msg, url):
 
 # ---- dashboard --------------------------------------------------------------
 CSS = """
-:root{--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--mut:#656d76;--bd:#d0d7de;--green:#1a7f37;--red:#cf222e;--amber:#9a6700;--blue:#0969da;--gray:#6e7781}
-@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8d96a0;--bd:#30363d;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--gray:#8b949e}}
+:root{--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--mut:#656d76;--bd:#d0d7de;--green:#1a7f37;--red:#cf222e;--amber:#9a6700;--blue:#0969da;--gray:#6e7781;--purple:#8250df}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8d96a0;--bd:#30363d;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--gray:#8b949e;--purple:#a371f7}}
 body{background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;max-width:960px;margin-inline:auto}
 header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
 h1{font-size:20px;margin:0}h2{font-size:16px;margin:28px 0 8px}h2 span{color:var(--mut);font-weight:400}
@@ -361,7 +364,8 @@ h1{font-size:20px;margin:0}h2{font-size:16px;margin:28px 0 8px}h2 span{color:var
 @media(prefers-reduced-motion:reduce){.spin{animation-duration:3s}}
 .meta{color:var(--mut);font-size:12px;margin:2px 0 6px}
 .b{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;border:1px solid currentColor;margin-right:4px}
-.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.gray{color:var(--gray)}.blue{color:var(--blue)}
+.b{text-decoration:none}a.b:hover{text-decoration:underline}
+.purple{color:var(--purple)}.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.gray{color:var(--gray)}.blue{color:var(--blue)}
 """
 
 JS = """
@@ -374,9 +378,10 @@ function update(h){document.getElementById('app').innerHTML=h;tick()}
 """
 
 
-def badge(text, cls, spinner=False):
+def badge(text, cls, spinner=False, url=None):
     spin = '<i class="spin"></i>' if spinner else ""
-    return f'<span class="b {cls}">{spin}{html.escape(text)}</span>'
+    tag = f'a href="{html.escape(url)}"' if url else "span"
+    return f'<{tag} class="b {cls}">{spin}{html.escape(text)}</{"a" if url else "span"}>'
 
 
 def card(p, show_author):
@@ -391,6 +396,11 @@ def card(p, show_author):
     if st:
         on = f" · on #{st['parent']}" if st["parent"] else " · base"
         b.append(badge(f"stack {st['pos']}/{st['size']}{on}", "blue"))
+    ms = p.get("milestone")
+    if ms:
+        due = ms["due"] and datetime.fromisoformat(ms["due"].replace("Z", "+00:00")).date()
+        label = f"milestone {ms['title']}" + (f" · due {due:%-d %b}" if due else "")
+        b.append(badge(label, "red" if due and due < datetime.now(TZ).date() else "purple", url=ms["url"]))
     if p["review"] == "changes":
         b.append(badge("changes requested", "red"))
     b.append({"green": badge("CI passing", "green"), "red": badge("CI failing", "red"),
