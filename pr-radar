@@ -370,7 +370,7 @@ h1{font-size:20px;margin:0}h2{font-size:16px;margin:28px 0 8px}h2 span{color:var
 .mut{color:var(--mut)}.pr{background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:10px 14px;margin-bottom:8px}
 .pr a.t{color:var(--fg);font-weight:600;text-decoration:none}.pr a.t:hover{color:var(--blue);text-decoration:underline}
 .stack{border:1px solid var(--blue);border-radius:8px;padding:8px 8px 0;margin-bottom:8px}.stack .pr{margin-left:12px}.sh{color:var(--blue);font-size:12px;font-weight:600;margin:0 0 8px 4px}
-@media(min-width:800px){body{max-width:1600px}.cols{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start}.cols h2{margin-top:20px}}
+@media(min-width:800px){body{max-width:1600px}.cols{display:flex;gap:24px;align-items:flex-start}.cols>div{flex:1}.cols h2{margin-top:20px}}
 .cols>div{min-width:0}
 .msg{max-width:520px;margin:80px auto;text-align:center}.msg button{font:inherit;margin-top:8px;padding:6px 16px;border-radius:6px;border:1px solid var(--bd);background:var(--card);color:var(--fg)}.msg h2{font-size:18px}.err{color:var(--red);font-size:12px;margin:8px 0 0}
 .spin{display:inline-block;width:8px;height:8px;margin-right:5px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px}
@@ -461,7 +461,7 @@ def render_body(viewer, needs, mine, fetched_at):
                 repos.setdefault(p["repo"], []).append(p)
             body = "".join(f'<div class="stack"><div class="sh">{html.escape(repo)} · {len(g)} PR{"s" if len(g) != 1 else ""}</div>'
                            + "".join(card(q, True) for q in g) + "</div>" for repo, g in repos.items())
-            return f'<h2>{title} <span>({len(items)})</span></h2>{body or "<p class=mut>Nothing here.</p>"}'
+            return f'<h2>{title} <span>({len(items)})</span></h2>{body}'
         stacks = {}
         for p in items:
             if p.get("stack"):
@@ -475,11 +475,14 @@ def render_body(viewer, needs, mine, fetched_at):
                 grp = sorted(u, key=lambda q: (q["stack"]["pos"], q["number"]))
                 blocks.append(f'<div class="stack"><div class="sh">Stack · {html.escape(grp[0]["repo"])} · {len(grp)} PRs</div>'
                               + "".join(card(q, show_author) for q in grp) + "</div>")
-        body = "".join(blocks) or '<p class="mut">Nothing here.</p>'
-        return f'<h2>{title} <span>({len(items)})</span></h2>{body}'
+        return f'<h2>{title} <span>({len(items)})</span></h2>{"".join(blocks)}'
+    columns = "".join(f"<div>{section(title, prs, show_author)}</div>"  # empty sections aren't shown at all
+                      for title, prs, show_author in (("My PRs", mine, False), ("Needs my review", needs, True)) if prs)
+    content = (f'<div class="cols">{columns}</div>' if columns else
+               message("Nothing needs your attention", "You have no open PRs and no review requests."))
     return f"""<header><h1>PR Radar <span class="mut">@{html.escape(viewer)}</span></h1>
 <span class="mut"><span class="idle-only">Last refreshed <time datetime="{fetched_at}">{fetched_at}</time> · {datetime.fromisoformat(fetched_at).astimezone(TZ):%a %H:%M} · sorted by {SORTS[SORT].lower().replace(': ', ', ')}</span><span class="busy-only"><i class="spin"></i>Refreshing…</span></span></header>
-<div class="cols"><div>{section("My PRs", mine, False)}</div><div>{section("Needs my review", needs, True)}</div></div>"""
+{content}"""
 
 
 def message(title, text, spinner=False, extra=""):
